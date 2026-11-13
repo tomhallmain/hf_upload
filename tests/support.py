@@ -9,6 +9,8 @@ Nothing here touches the network, your git config, or your Hugging Face token:
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import json
 import os
 import subprocess
@@ -91,10 +93,14 @@ def make_repo(path: Path, env: dict, files: dict | None = None) -> list[str]:
 class BareHub:
     """A local bare repo playing the Hub repo, reached through hub_redirect_config().
 
-    `commit_folder` does what an API upload does on the real Hub: it makes one new commit on
-    main from a folder's files (adds and updates only, honouring ignore patterns).
+    `commit_folder` does what upload_folder does on the real Hub: it makes one new commit on
+    main from a folder's files, matching ignore/delete patterns against the full repo path
+    like huggingface_hub does. `tree` reports files of at least LFS_MIN_SIZE bytes as LFS
+    files with their SHA-256, like HfApi.list_repo_tree.
     Paths derive from `root`, so another process can attach with BareHub(root, env).
     """
+
+    LFS_MIN_SIZE = 1024
 
     def __init__(self, root: Path, env: dict):
         self.root = Path(root)
@@ -121,25 +127,54 @@ class BareHub:
     def clone(self, dest: Path) -> None:
         git(dest.parent, "clone", "-q", HUB_URL, str(dest), env=self.env)
 
-    def commit_folder(self, folder: Path, message: str, ignore_patterns=()) -> str:
-        import fnmatch
+    def tree(self) -> list:
+        """Files on main, like HfApi.list_repo_tree(recursive=True)."""
+        entries = []
+        for line in git(self.bare, "ls-tree", "-r", "-l", "main", env=self.env).splitlines():
+            meta, path = line.split("\t", 1)
+            _mode, _type, blob_id, size = meta.split()
+            size = int(size)
+            lfs = None
+            if size >= self.LFS_MIN_SIZE:
+                content = subprocess.run(
+                    ["git", "-C", str(self.bare), "cat-file", "blob", blob_id],
+                    env=self.env, capture_output=True, check=True,
+                ).stdout
+                lfs = types.SimpleNamespace(
+                    size=size, sha256=hashlib.sha256(content).hexdigest(), pointer_size=130
+                )
+            entries.append(types.SimpleNamespace(path=path, size=size, blob_id=blob_id, lfs=lfs))
+        return entries
+
+    def commit_folder(self, folder: Path, message: str, ignore_patterns=(), delete_patterns=None):
+        """Returns (new head commit id, repo paths whose content was sent)."""
         import shutil
 
+        def matches(path, patterns):
+            return any(fnmatch.fnmatch(path, p + "*" if p.endswith("/") else p) for p in patterns)
+
         git(self.work, "pull", "-q", "--ff-only", "origin", "main", env=self.env)
-        for src in Path(folder).rglob("*"):
-            rel = src.relative_to(folder)
-            if ".git" in rel.parts or any(
-                fnmatch.fnmatch(part, pat) for part in rel.parts for pat in ignore_patterns
-            ):
+        sent = []
+        # Sort by posix string: Windows path objects compare case-insensitively, which
+        # would make the order (and the `sent` list) differ between operating systems.
+        for src in sorted(Path(folder).rglob("*"), key=lambda p: p.relative_to(folder).as_posix()):
+            rel = src.relative_to(folder).as_posix()
+            if not src.is_file() or ".git" in rel.split("/") or matches(rel, ignore_patterns):
                 continue
-            if src.is_file():
-                (self.work / rel).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, self.work / rel)
+            sent.append(rel)
+            (self.work / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, self.work / rel)
+        if delete_patterns:
+            # Like upload_folder: delete matching Hub files that are not part of this upload,
+            # including files left out by ignore_patterns. Never .gitattributes.
+            for path in git(self.work, "ls-files", env=self.env).splitlines():
+                if path not in sent and path != ".gitattributes" and matches(path, delete_patterns):
+                    git(self.work, "rm", "-q", path, env=self.env)
         git(self.work, "add", "-A", env=self.env)
         if git(self.work, "status", "--porcelain", env=self.env):
             git(self.work, "commit", "-q", "-m", message, env=self.env)
             git(self.work, "push", "-q", "origin", "HEAD:main", env=self.env)
-        return self.head()
+        return self.head(), sent
 
     def push_change(self, name: str, content: str) -> str:
         """Someone else changes the Hub repo (e.g. a web edit)."""
@@ -161,12 +196,15 @@ def fake_sha(n: int) -> str:
 class FakeHub:
     """State and call log behind the fake huggingface_hub module."""
 
-    def __init__(self, commits=None, commits_error=None, repo_missing=False, saved_token=None):
+    def __init__(self, commits=None, commits_error=None, repo_missing=False, saved_token=None,
+                 tree_error=None):
         self.commits = list(commits or [])
         self.commits_error = commits_error
+        self.tree_error = tree_error
         self.repo_missing = repo_missing
         self.saved_token = saved_token
         self.uploads: list[dict] = []
+        self.sent: list[list[str]] = []  # per upload: repo paths whose content was sent
         # When set, uploads commit to this BareHub and commits are read from it.
         self.bare_hub: BareHub | None = None
         self.after_upload = None  # optional callable, run after each upload
@@ -175,9 +213,11 @@ class FakeHub:
         self.uploads.append(kwargs)
         result = None
         if self.bare_hub is not None:
-            oid = self.bare_hub.commit_folder(
-                Path(kwargs["folder_path"]), kwargs["commit_message"], kwargs.get("ignore_patterns", ())
+            oid, sent = self.bare_hub.commit_folder(
+                Path(kwargs["folder_path"]), kwargs["commit_message"],
+                kwargs.get("ignore_patterns", ()), kwargs.get("delete_patterns"),
             )
+            self.sent.append(sent)
             result = types.SimpleNamespace(oid=oid)  # like huggingface_hub's CommitInfo
         if self.after_upload:
             self.after_upload()
@@ -208,6 +248,11 @@ class FakeHub:
                     raise state.commits_error
                 commits = state.bare_hub.commits() if state.bare_hub else state.commits
                 return [Commit(c) for c in commits]
+
+            def list_repo_tree(self, repo_id, recursive=False, token=None):
+                if state.tree_error:
+                    raise state.tree_error
+                return state.bare_hub.tree() if state.bare_hub else []
 
         hub.__version__ = "1.30.0"
         hub.HfApi = HfApi
@@ -251,14 +296,15 @@ def _bare_hub():
     return BareHub(Path(root), dict(os.environ))
 
 def upload_folder(**kwargs):
-    _log("upload_folder", **kwargs)
     hub = _bare_hub()
     if hub is None:
+        _log("upload_folder", **kwargs)
         return None
     from pathlib import Path
     from types import SimpleNamespace
-    oid = hub.commit_folder(Path(kwargs["folder_path"]), kwargs["commit_message"],
-                            kwargs.get("ignore_patterns", ()))
+    oid, sent = hub.commit_folder(Path(kwargs["folder_path"]), kwargs["commit_message"],
+                                  kwargs.get("ignore_patterns", ()), kwargs.get("delete_patterns"))
+    _log("upload_folder", sent=sent, **kwargs)
     return SimpleNamespace(oid=oid)
 
 class _Commit:
@@ -279,6 +325,13 @@ class HfApi:
         hub = _bare_hub()
         commits = hub.commits() if hub else state.get("commits", [])
         return [_Commit(c) for c in commits]
+
+    def list_repo_tree(self, repo_id, recursive=False, token=None):
+        state = _state()
+        if state.get("tree_error"):
+            raise ConnectionError(state["tree_error"])
+        hub = _bare_hub()
+        return hub.tree() if hub else []
 '''
 
 

@@ -9,6 +9,11 @@ It has two upload methods:
   and large files such as `model.safetensors` need no Git LFS setup. If the `hf-xet` package
   is installed, large files use Xet storage automatically: only changed chunks are sent.
   There is nothing to enable per repository.
+
+  Large files that are already on the Hub unchanged are not uploaded at all. The script
+  compares each one's SHA-256 with the hash the Hub stores before uploading. This is needed
+  because `huggingface_hub` sends every large file before it checks whether the file
+  changed, and without this check Xet would still transfer part of an unchanged file.
 - **`git`:** commits and runs `git push` to the Hub's `main` branch. This needs a local clone
   whose history matches the Hub repo, and needs Git LFS for files over 10 MB.
 
@@ -56,7 +61,7 @@ the current directory itself.
 | `-p, --path` | Folder to upload |
 | `-m, --message` | Commit message (default: "Upload from script") |
 | `--method {auto,hub,git}` | Upload method (default: `auto`) |
-| `--delete-missing` | `hub` method: delete files from the Hub that are missing locally |
+| `--delete-missing` | `hub` method: delete files from the Hub that are missing locally (never `.gitattributes`). Without it, such files are kept, and listed before uploading |
 | `--set-remote-only` | Set `origin` to `https://huggingface.co/<repo_id>`, then exit |
 | `--ignore-local-git` | Skip the local-git-vs-Hub history check (see below) |
 | `--no-sync-git` | `hub` method: don't move local git to the new Hub commit after uploading |

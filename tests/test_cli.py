@@ -70,7 +70,7 @@ class HubUploadCliTests(CliTestCase):
         self.assertEqual(call["repo_id"], REPO_ID)
         self.assertEqual(call["token"], TOKEN)
         self.assertEqual(call["commit_message"], "update files")
-        self.assertEqual(call["delete_patterns"], ["*"])
+        self.assertNotIn("delete_patterns", call)  # the fake Hub lists no files missing locally
         self.assertNotIn("use_xet", call)
         self.assertEqual(self.git("config", "--get", "remote.origin.url"), HUB_URL)
         self.assertNotIn("xet", self.git("config", "--list", "--local"))
@@ -178,7 +178,9 @@ class SyncCliTests(CliTestCase):
 
     def setUp(self):
         super().setUp()
-        self.bare_hub = BareHub(self.root, self.git_env).create({"README.md": "v1\n"})
+        self.bare_hub = BareHub(self.root, self.git_env).create(
+            {"README.md": "v1\n", "model.safetensors": b"\1" * 4096}  # 4 KB: an LFS file
+        )
         self.bare_hub.clone(self.repo)
         self.fake.set_state(bare_hub_root=str(self.root))
 
@@ -187,11 +189,12 @@ class SyncCliTests(CliTestCase):
         return self.run_cli("-p", str(self.repo), "-m", f"README {text.strip()}", *extra)
 
     def test_consecutive_uploads(self):
-        for text in ("v2\n", "v3\n"):
+        for i, text in enumerate(("v2\n", "v3\n")):
             with self.subTest(text=text):
                 result = self.edit_and_upload(text)
                 self.assertExit(result, 0)
                 self.assertNotIn("is behind", self.output)
+                self.assertEqual(self.uploads()[i]["sent"], ["README.md"])  # model not resent
                 self.assertEqual(self.git("rev-parse", "HEAD"), self.bare_hub.head())
                 self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(

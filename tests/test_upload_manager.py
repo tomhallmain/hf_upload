@@ -242,11 +242,21 @@ class HubUploadTests(ScriptTestCase):
         self.call(self.manager().upload_with_huggingface_hub)
         self.assertEqual(self.hub.uploads[0]["commit_message"], "Upload from script")
 
-    def test_delete_missing(self):
+    def test_delete_missing_with_nothing_missing(self):
         manager = self.manager()
         manager.delete_missing = True
         self.call(manager.upload_with_huggingface_hub)
+        self.assertNotIn("delete_patterns", self.hub.uploads[0])  # the (empty) Hub lacks nothing
+
+    def test_delete_missing_when_hub_files_unknown(self):
+        # Without the Hub's file list nothing is left out of the upload, so "*" is safe.
+        self.hub.tree_error = ConnectionError("offline")
+        manager = self.manager()
+        manager.delete_missing = True
+        ok, out = self.call(manager.upload_with_huggingface_hub)
+        self.assertTrue(ok)
         self.assertEqual(self.hub.uploads[0]["delete_patterns"], ["*"])
+        self.assertIn("Could not list the Hub's files", out)
 
     def test_sets_remote_after_upload(self):
         self.call(self.manager().upload_with_huggingface_hub)
@@ -369,21 +379,18 @@ class LargeFileTests(ScriptTestCase):
         self.assertTrue(self.call(manager.offer_storage_setup, [])[0])
 
 
-class SyncAfterUploadTests(ScriptTestCase):
-    """After an API upload, local git moves to the commit the upload created (TODO item 1).
+class BareHubTestCase(ScriptTestCase):
+    """The "Hub" is a local bare repo; the fake upload_folder commits the folder to it and
+    returns the new commit id, and self.repo is a real clone of it."""
 
-    The "Hub" is a local bare repo; the fake upload_folder commits the folder to it and
-    returns the new commit id, and self.repo is a real clone of it.
-    """
+    hub_files = {"README.md": "v1\n", "model/weights.bin": "w1\n", "notes.txt": "n\n"}
 
     def extra_git_config(self):
         return hub_redirect_config(self.root / "hub.git")
 
     def setUp(self):
         super().setUp()
-        self.bare_hub = BareHub(self.root, self.env).create(
-            {"README.md": "v1\n", "model/weights.bin": "w1\n", "notes.txt": "n\n"}
-        )
+        self.bare_hub = BareHub(self.root, self.env).create(self.hub_files)
         self.bare_hub.clone(self.repo)
         self.hub.bare_hub = self.bare_hub
         self.start = self.git("rev-parse", "HEAD")
@@ -402,6 +409,10 @@ class SyncAfterUploadTests(ScriptTestCase):
 
     def head(self):
         return self.git("rev-parse", "HEAD")
+
+
+class SyncAfterUploadTests(BareHubTestCase):
+    """After an API upload, local git moves to the commit the upload created."""
 
     def test_local_moves_to_uploaded_commit(self):
         (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
@@ -487,6 +498,68 @@ class SyncAfterUploadTests(ScriptTestCase):
         out = self.upload()
         self.assertEqual(self.head(), self.start)
         self.assertIn("did not report its commit id", out)
+
+
+class UnchangedLargeFileTests(BareHubTestCase):
+    """Large (LFS/Xet) files already on the Hub with the same SHA-256 are not sent again."""
+
+    WEIGHTS = bytes(range(256)) * 16  # 4 KB, above BareHub.LFS_MIN_SIZE: an LFS file
+    hub_files = {
+        "README.md": "v1\n",
+        "model/weights.bin": WEIGHTS,
+        "data[1].bin": WEIGHTS[::-1],  # glob characters in the name
+        "notes.txt": "n\n",
+    }
+
+    def hub_paths(self):
+        return {e.path for e in self.bare_hub.tree()}
+
+    def test_unchanged_large_files_not_sent(self):
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        out = self.upload()
+        self.assertEqual(self.hub.sent[0], ["README.md", "notes.txt"])
+        self.assertIn("Unchanged on the Hub, not uploading: data[1].bin, model/weights.bin", out)
+        self.assertEqual(self.hub_paths(), set(self.hub_files))  # still on the Hub
+        self.assertEqual(self.git("status", "--porcelain"), "")  # and sync still works
+
+    def test_changed_large_file_same_size_is_sent(self):
+        (self.repo / "model" / "weights.bin").write_bytes(self.WEIGHTS[::-1])  # same size
+        self.upload()
+        self.assertIn("model/weights.bin", self.hub.sent[0])
+        self.assertNotIn("data[1].bin", self.hub.sent[0])
+
+    def test_changed_large_file_new_size_is_sent(self):
+        (self.repo / "model" / "weights.bin").write_bytes(self.WEIGHTS + b"x")
+        self.upload()
+        self.assertIn("model/weights.bin", self.hub.sent[0])
+
+    def test_delete_missing_deletes_only_missing_files(self):
+        # With a "*" delete pattern, upload_folder would also delete the unchanged large
+        # files left out of the upload.
+        (self.repo / "notes.txt").unlink()
+        manager = self.manager()
+        manager.delete_missing = True
+        out = self.upload(manager=manager)
+        self.assertEqual(self.hub.uploads[0]["delete_patterns"], ["notes.txt"])
+        self.assertEqual(self.hub_paths(), {"README.md", "model/weights.bin", "data[1].bin"})
+        self.assertIn("Deleting from the Hub (missing locally): notes.txt", out)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_missing_file_kept_and_reported_without_delete_missing(self):
+        (self.repo / "notes.txt").unlink()
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        out = self.upload()
+        self.assertNotIn("delete_patterns", self.hub.uploads[0])
+        self.assertIn("notes.txt", self.hub_paths())
+        self.assertIn("On the Hub but not in the folder, so kept: notes.txt", out)
+        self.assertEqual(self.git("status", "--porcelain"), "D notes.txt")
+        self.assertIn("rerun with\n   --delete-missing", out)  # in the post-sync summary too
+
+    def test_hub_file_list_unavailable_sends_everything(self):
+        self.hub.tree_error = ConnectionError("offline")
+        out = self.upload()
+        self.assertIn("model/weights.bin", self.hub.sent[0])
+        self.assertIn("large files will be sent even if unchanged", out)
 
 
 class FindGitRepoTests(ScriptTestCase):

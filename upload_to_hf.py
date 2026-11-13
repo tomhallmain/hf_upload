@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import argparse
+import glob
+import hashlib
 from datetime import datetime
 import tempfile
 import shutil
@@ -548,11 +550,25 @@ class HFUploadManager:
                 ]
             }
 
-            # Upload folder. Safe to repeat for updates: each call makes one new Hub commit, and
-            # files whose content is unchanged are skipped. Local deletions are NOT mirrored
-            # unless delete_patterns is set (see --delete-missing).
+            # Safe to repeat for updates: each call makes one new Hub commit. huggingface_hub
+            # sends every large (LFS/Xet) file before it notices the file is unchanged, so
+            # unchanged large files are found here first and left out of the upload.
+            unchanged, remote_only = self.plan_upload(api)
+            if unchanged:
+                upload_kwargs["ignore_patterns"] += [glob.escape(p) for p in unchanged]
+
+            # Local deletions are mirrored only with --delete-missing, and then only for the
+            # exact files missing locally: a "*" pattern would also delete the unchanged
+            # files just left out above.
             if self.delete_missing:
-                upload_kwargs["delete_patterns"] = ["*"]
+                if remote_only is None:  # Hub file list unknown; nothing was left out above
+                    upload_kwargs["delete_patterns"] = ["*"]
+                elif remote_only:
+                    upload_kwargs["delete_patterns"] = [glob.escape(p) for p in remote_only]
+                    print(f"🗑️  Deleting from the Hub (missing locally): {', '.join(remote_only)}")
+            elif remote_only:
+                print(f"ℹ️  On the Hub but not in the folder, so kept: {', '.join(remote_only)}")
+                print("   Rerun with --delete-missing to delete them from the Hub.")
 
             has_git = (self.repo_path / ".git").is_dir()
             sync = has_git and self.sync_git
@@ -583,6 +599,66 @@ class HFUploadManager:
                         self._print_manual_sync()
         print(f"📍 Your model is available at: https://huggingface.co/{self.repo_id}")
         return True
+
+    def _local_files(self) -> Dict[str, Path]:
+        """Files in the folder by repo path (posix), excluding .git and the HF cache folder.
+
+        Deliberately broader than upload_folder's own filtering: used to decide what is
+        missing locally, so erring towards "present" can only mean fewer deletions.
+        """
+        files = {}
+        for path in self.repo_path.rglob("*"):
+            rel = path.relative_to(self.repo_path).as_posix()
+            if ".git" in rel.split("/") or rel.startswith(".cache/huggingface/"):
+                continue
+            if path.is_file():
+                files[rel] = path
+        return files
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def plan_upload(self, api) -> Tuple[List[str], Optional[List[str]]]:
+        """Compare the folder with the Hub's current files.
+
+        Returns (unchanged_large_files, hub_only_files):
+        - unchanged_large_files: local files stored as LFS/Xet on the Hub whose SHA-256 matches
+        - hub_only_files: files on the Hub that are not in the folder (never .gitattributes),
+          or None if the Hub's file list could not be read
+        """
+        try:
+            entries = list(api.list_repo_tree(self.repo_id, recursive=True, token=self.token))
+        except Exception as e:
+            print(f"⚠️  Could not list the Hub's files ({type(e).__name__}); "
+                  "large files will be sent even if unchanged.")
+            return [], None
+        remote = {e.path: e for e in entries if hasattr(e, "blob_id")}  # files, not folders
+        local = self._local_files()
+
+        def lfs_field(lfs, name):
+            return lfs.get(name) if isinstance(lfs, dict) else getattr(lfs, name, None)
+
+        candidates = []
+        for rel, path in local.items():
+            lfs = getattr(remote.get(rel), "lfs", None)
+            if lfs and lfs_field(lfs, "size") == path.stat().st_size:
+                candidates.append((rel, path, lfs_field(lfs, "sha256")))
+        unchanged = []
+        if candidates:
+            print(f"🔍 Checking {len(candidates)} large file(s) against the Hub...")
+            for rel, path, remote_sha in candidates:
+                if self._sha256(path) == remote_sha:
+                    unchanged.append(rel)
+        if unchanged:
+            print(f"✓ Unchanged on the Hub, not uploading: {', '.join(sorted(unchanged))}")
+
+        hub_only = sorted(p for p in remote if p not in local and p != ".gitattributes")
+        return sorted(unchanged), hub_only
 
     @staticmethod
     def _print_manual_sync():
@@ -648,6 +724,9 @@ class HFUploadManager:
                 print(f"     {line}")
             if len(lines) > 10:
                 print(f"     ... and {len(lines) - 10} more (git status)")
+            if any("D" in line[:2] for line in lines):
+                print("   Files deleted locally (D) are still on the Hub: rerun with")
+                print("   --delete-missing to delete them there.")
         return True
 
 
