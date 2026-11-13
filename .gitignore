@@ -1,0 +1,26 @@
+# Python bytecode (created when the script or tests run)
+__pycache__/
+*.py[cod]
+
+# Test runners and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets: never commit a Hugging Face token
+.env
+.env.*
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
