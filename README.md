@@ -59,6 +59,7 @@ the current directory itself.
 | `--delete-missing` | `hub` method: delete files from the Hub that are missing locally |
 | `--set-remote-only` | Set `origin` to `https://huggingface.co/<repo_id>`, then exit |
 | `--ignore-local-git` | Skip the local-git-vs-Hub history check (see below) |
+| `--no-sync-git` | `hub` method: don't move local git to the new Hub commit after uploading |
 | `--use-xet` | `hub` method: fail unless `hf_xet` is installed |
 | `--threshold MB` | `git` method: size above which files count as large (default: 50) |
 | `--token` | Hugging Face token |
@@ -69,8 +70,22 @@ Exit code: 0 on success, 1 on failure.
 
 ## Local git and the Hub
 
-An API upload creates commits only on the Hub. A local `.git` in the uploaded folder does
-not follow them, so after an API upload, local git history and Hub history are unrelated.
+An API upload creates its commit on the Hub, not in your local `.git`.
+
+**Sync after upload.** When the folder is a clone of the Hub repo and local `HEAD` was the
+Hub's latest commit, the script then runs `git fetch origin` and `git reset --mixed` to the
+commit the upload created. Your files are not changed: they are exactly what was uploaded,
+so `git status` comes out clean, apart from files the upload skipped (such as
+`.gitattributes`) or local deletions not uploaded (without `--delete-missing`).
+The sync is skipped, with the manual commands printed, when:
+
+- local has commits the Hub doesn't (they are never moved away from)
+- the fetch fails (a private repo needs git credentials: `hf auth login`, then store the
+  token as a git credential)
+- the Hub changed again right after the upload
+- `origin` points somewhere else, or `--no-sync-git` is given
+
+Sync manually with `git fetch origin` then `git reset origin/main` (never `--hard`).
 
 Before uploading, the script compares local commits with the Hub repo's commits and stops
 when they don't match. It never modifies or deletes your local `.git`.
@@ -93,8 +108,11 @@ Pick one workflow per model:
   git lfs install
   git clone https://huggingface.co/<user>/<repo>
   ```
-  Commit and push from the clone. If you also make API uploads, run `git pull` before
-  each push.
+  Commit and push from the clone, or upload from it with this script: the sync above keeps
+  the clone on the Hub's latest commit. After API uploads made without the sync
+  (`--no-sync-git`, another machine, the website), run `git pull` before your next push.
+  To attach Hub history to an existing folder without cloning again, see
+  [docs/TODO.md](docs/TODO.md), item 2.
 
 ## Tests
 
@@ -105,7 +123,8 @@ python -m unittest -v      # or: python -m pytest
 ```
 
 - `tests/test_upload_manager.py`: in-process tests of `HFUploadManager` (token lookup,
-  remote handling, the history check, upload arguments, git push, large-file handling).
+  remote handling, the history check, upload arguments, syncing after upload, git push,
+  large-file handling).
 - `tests/test_cli.py`: runs the script as a subprocess for end-to-end cases.
 - `tests/support.py`: shared isolation helpers and fakes.
 
@@ -114,6 +133,7 @@ The tests use no network, no real token and none of your git settings:
 - git runs with a temporary global config;
 - `huggingface_hub` and `hf_xet` are replaced by fakes that record calls, with
   `HF_HUB_OFFLINE` and a temporary `HF_HOME` set as a backup;
-- git pushes go to a local bare repository through `pushInsteadOf`.
+- clones, fetches and pushes to the Hub URL go to a local bare repository through
+  `insteadOf`, and the fake `upload_folder` commits to that repository, as the real Hub does.
 
 The Git LFS menu test uses a shell-script stand-in for `git-lfs`, so it is skipped on Windows.

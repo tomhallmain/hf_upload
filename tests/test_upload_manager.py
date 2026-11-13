@@ -18,12 +18,13 @@ from tests.support import (
     HUB_URL,
     REPO_ID,
     TOKEN,
+    BareHub,
     FakeHub,
     fake_sha,
     git,
+    hub_redirect_config,
     isolated_env,
     make_repo,
-    push_redirect_config,
     tempdir,
 )
 
@@ -281,11 +282,11 @@ class HubUploadTests(ScriptTestCase):
 
 
 class GitPushTests(ScriptTestCase):
-    """push_to_huggingface against a local bare repo standing in for the Hub (via pushInsteadOf)."""
+    """push_to_huggingface against a local bare repo standing in for the Hub (via insteadOf)."""
 
     def extra_git_config(self):
         self.bare = self.root / "hub.git"
-        return push_redirect_config(self.bare)
+        return hub_redirect_config(self.bare)
 
     def setUp(self):
         super().setUp()
@@ -366,6 +367,126 @@ class LargeFileTests(ScriptTestCase):
         self.assertFalse(ok)
         self.assertNotIn("Xet", out)
         self.assertTrue(self.call(manager.offer_storage_setup, [])[0])
+
+
+class SyncAfterUploadTests(ScriptTestCase):
+    """After an API upload, local git moves to the commit the upload created (TODO item 1).
+
+    The "Hub" is a local bare repo; the fake upload_folder commits the folder to it and
+    returns the new commit id, and self.repo is a real clone of it.
+    """
+
+    def extra_git_config(self):
+        return hub_redirect_config(self.root / "hub.git")
+
+    def setUp(self):
+        super().setUp()
+        self.bare_hub = BareHub(self.root, self.env).create(
+            {"README.md": "v1\n", "model/weights.bin": "w1\n", "notes.txt": "n\n"}
+        )
+        self.bare_hub.clone(self.repo)
+        self.hub.bare_hub = self.bare_hub
+        self.start = self.git("rev-parse", "HEAD")
+
+    def snapshot(self):
+        return {
+            p.relative_to(self.repo).as_posix(): p.read_bytes()
+            for p in self.repo.rglob("*")
+            if p.is_file() and ".git" not in p.relative_to(self.repo).parts
+        }
+
+    def upload(self, message="update", manager=None):
+        ok, out = self.call((manager or self.manager()).upload_with_huggingface_hub, message)
+        self.assertTrue(ok, out)  # sync problems never fail the upload
+        return out
+
+    def head(self):
+        return self.git("rev-parse", "HEAD")
+
+    def test_local_moves_to_uploaded_commit(self):
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        (self.repo / "requirements.txt").write_text("numpy\n", encoding="utf-8")
+        before = self.snapshot()
+        out = self.upload("add requirements")
+        self.assertNotEqual(self.bare_hub.head(), self.start)
+        self.assertEqual(self.head(), self.bare_hub.head())
+        self.assertEqual(self.git("rev-parse", "origin/main"), self.bare_hub.head())
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "add requirements")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.snapshot(), before)  # working tree untouched
+        self.assertIn("Local git now at", out)
+
+    def test_lists_remaining_differences(self):
+        # Without --delete-missing a local deletion is not uploaded, so it stays a difference.
+        (self.repo / "notes.txt").unlink()
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        out = self.upload()
+        self.assertEqual(self.head(), self.bare_hub.head())
+        self.assertEqual(self.git("status", "--porcelain"), "D notes.txt")
+        self.assertIn("notes.txt", out)
+
+    def test_nothing_changed(self):
+        out = self.upload()
+        self.assertEqual(self.head(), self.start)
+        self.assertEqual(self.bare_hub.head(), self.start)
+        self.assertIn("already matches", out)
+
+    def test_local_only_commits_are_not_moved(self):
+        (self.repo / "local.txt").write_text("x\n", encoding="utf-8")
+        self.git("add", "local.txt")
+        self.git("commit", "-q", "-m", "local only")
+        local_head = self.head()
+        out = self.upload()
+        self.assertEqual(self.head(), local_head)
+        self.assertNotEqual(self.bare_hub.head(), self.start)  # the upload itself happened
+        self.assertIn("Local git not synced", out)
+        self.assertIn("git reset origin/main", out)
+
+    def test_fetch_failure_leaves_local_unchanged(self):
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        self.hub.after_upload = lambda: self.bare_hub.bare.rename(self.root / "hub-gone.git")
+        out = self.upload()
+        self.assertEqual(self.head(), self.start)
+        self.assertIn("git fetch failed", out)
+        self.assertIn("git reset origin/main", out)
+
+    def test_hub_changed_again_after_upload(self):
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        self.hub.after_upload = lambda: self.bare_hub.push_change("web-edit.txt", "x\n")
+        out = self.upload()
+        self.assertEqual(self.head(), self.start)
+        self.assertIn("another change landed", out)
+
+    def test_no_sync_option(self):
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        manager = self.manager()
+        manager.sync_git = False
+        out = self.upload(manager=manager)
+        self.assertEqual(self.head(), self.start)
+        self.assertEqual(self.git("rev-parse", "origin/main"), self.start)  # not even fetched
+        self.assertNotIn("Syncing", out)
+
+    def test_foreign_origin_is_not_synced(self):
+        self.git("remote", "set-url", "origin", "https://github.com/someone/else.git")
+        (self.repo / "README.md").write_text("v2\n", encoding="utf-8")
+        out = self.upload()
+        self.assertEqual(self.head(), self.start)
+        self.assertIn("origin is not the Hub repo", out)
+
+    def test_folder_without_git(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        (plain / "README.md").write_text("plain\n", encoding="utf-8")
+        out = self.upload(manager=up.HFUploadManager(plain, REPO_ID, TOKEN))
+        self.assertNotIn("Syncing", out)
+        self.assertFalse((plain / ".git").exists())
+
+    def test_upload_without_commit_id(self):
+        # Older huggingface_hub versions may not return a CommitInfo.
+        self.hub.bare_hub = None
+        out = self.upload()
+        self.assertEqual(self.head(), self.start)
+        self.assertIn("did not report its commit id", out)
 
 
 class FindGitRepoTests(ScriptTestCase):

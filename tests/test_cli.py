@@ -1,7 +1,7 @@
 """End-to-end tests: run upload_to_hf.py as a subprocess, the way it is used.
 
 A fake huggingface_hub package is first on PYTHONPATH and records every upload_folder call;
-git pushes go to a local bare repo through pushInsteadOf. No network, no real token.
+git clone/fetch/push go to a local bare repo through insteadOf. No network, no real token.
 Run from the hf_upload folder:  python -m unittest -v   (or: python -m pytest)
 """
 
@@ -16,12 +16,13 @@ from tests.support import (
     HUB_URL,
     REPO_ID,
     TOKEN,
+    BareHub,
     FakeHubProcess,
     fake_sha,
     git,
+    hub_redirect_config,
     isolated_env,
     make_repo,
-    push_redirect_config,
     run_script,
     tempdir,
 )
@@ -36,7 +37,7 @@ class CliTestCase(unittest.TestCase):
         self.root = Path(tmp.name)
         self.repo = self.root / "repo"
         self.bare = self.root / "hub.git"
-        self.git_env = isolated_env(self.root, push_redirect_config(self.bare))
+        self.git_env = isolated_env(self.root, hub_redirect_config(self.bare))
         self.fake = FakeHubProcess(self.root, with_xet=self.with_xet)
         self.env = self.fake.env(self.git_env)
         self.env["HF_TOKEN"] = TOKEN
@@ -71,7 +72,7 @@ class HubUploadCliTests(CliTestCase):
         self.assertEqual(call["commit_message"], "update files")
         self.assertEqual(call["delete_patterns"], ["*"])
         self.assertNotIn("use_xet", call)
-        self.assertEqual(self.git("remote", "get-url", "origin"), HUB_URL)
+        self.assertEqual(self.git("config", "--get", "remote.origin.url"), HUB_URL)
         self.assertNotIn("xet", self.git("config", "--list", "--local"))
         self.assertFalse((self.repo / ".gitignore").exists())
 
@@ -133,7 +134,7 @@ class SetRemoteOnlyCliTests(CliTestCase):
         make_repo(self.repo, self.git_env)
         result = self.run_cli("-p", str(self.repo), "--set-remote-only")
         self.assertExit(result, 0)
-        self.assertEqual(self.git("remote", "get-url", "origin"), HUB_URL)
+        self.assertEqual(self.git("config", "--get", "remote.origin.url"), HUB_URL)
         self.assertEqual(self.fake.calls(), [])
 
     def test_repairs_token_in_url(self):
@@ -141,7 +142,7 @@ class SetRemoteOnlyCliTests(CliTestCase):
         self.git("remote", "add", "origin", f"https://{TOKEN}@huggingface.co/{REPO_ID}")
         result = self.run_cli("-p", str(self.repo), "--set-remote-only")
         self.assertExit(result, 0)
-        self.assertEqual(self.git("remote", "get-url", "origin"), HUB_URL)
+        self.assertEqual(self.git("config", "--get", "remote.origin.url"), HUB_URL)
         self.assertNotIn(TOKEN, self.output)
 
     def test_not_a_git_repo(self):
@@ -168,6 +169,41 @@ class NoXetCliTests(CliTestCase):
     def test_upload_works_without_hf_xet(self):
         result = self.run_cli("-p", str(self.repo), "--method", "hub")
         self.assertExit(result, 0)
+        self.assertEqual(len(self.uploads()), 1)
+
+
+class SyncCliTests(CliTestCase):
+    """Repeated API uploads from a clone: each run leaves local git on the new Hub commit,
+    so the next run passes the history check without a manual pull."""
+
+    def setUp(self):
+        super().setUp()
+        self.bare_hub = BareHub(self.root, self.git_env).create({"README.md": "v1\n"})
+        self.bare_hub.clone(self.repo)
+        self.fake.set_state(bare_hub_root=str(self.root))
+
+    def edit_and_upload(self, text, *extra):
+        (self.repo / "README.md").write_text(text, encoding="utf-8")
+        return self.run_cli("-p", str(self.repo), "-m", f"README {text.strip()}", *extra)
+
+    def test_consecutive_uploads(self):
+        for text in ("v2\n", "v3\n"):
+            with self.subTest(text=text):
+                result = self.edit_and_upload(text)
+                self.assertExit(result, 0)
+                self.assertNotIn("is behind", self.output)
+                self.assertEqual(self.git("rev-parse", "HEAD"), self.bare_hub.head())
+                self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(
+            self.git("log", "--format=%s").splitlines()[:2], ["README v3", "README v2"]
+        )
+
+    def test_no_sync_git_then_next_upload_is_blocked(self):
+        self.assertExit(self.edit_and_upload("v2\n", "--no-sync-git"), 0)
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), self.bare_hub.head())
+        result = self.edit_and_upload("v3\n")
+        self.assertExit(result, 1)
+        self.assertIn("is behind", self.output)
         self.assertEqual(len(self.uploads()), 1)
 
 

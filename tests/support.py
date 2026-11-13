@@ -23,7 +23,7 @@ SCRIPT = SCRIPT_DIR / "upload_to_hf.py"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-REPO_ID = "example-user/fake-test-repo"  # never contacted: pushes are redirected, hub is faked
+REPO_ID = "example-user/fake-test-repo"  # never contacted: git is redirected, hub is faked
 HUB_URL = f"https://huggingface.co/{REPO_ID}"
 TOKEN = "hf_test_token_not_real"
 
@@ -56,10 +56,11 @@ def isolated_env(root: Path, extra_git_config: str = "") -> dict:
     return env
 
 
-def push_redirect_config(bare_repo: Path) -> str:
-    """Git config that sends pushes for HUB_URL to a local bare repo. `git remote get-url`
-    still reports HUB_URL, so the script's remote checks see the real Hub URL."""
-    return f'[url "{bare_repo.resolve().as_uri()}"]\n\tpushInsteadOf = {HUB_URL}\n'
+def hub_redirect_config(bare_repo: Path) -> str:
+    """Git config that sends clone/fetch/push for HUB_URL to a local bare repo. Remotes keep
+    HUB_URL as their configured URL (`git config remote.origin.url`), which is what the
+    script checks."""
+    return f'[url "{bare_repo.resolve().as_uri()}"]\n\tinsteadOf = {HUB_URL}\n'
 
 
 def git(repo: Path, *args: str, env: dict) -> str:
@@ -87,6 +88,69 @@ def make_repo(path: Path, env: dict, files: dict | None = None) -> list[str]:
     return commits
 
 
+class BareHub:
+    """A local bare repo playing the Hub repo, reached through hub_redirect_config().
+
+    `commit_folder` does what an API upload does on the real Hub: it makes one new commit on
+    main from a folder's files (adds and updates only, honouring ignore patterns).
+    Paths derive from `root`, so another process can attach with BareHub(root, env).
+    """
+
+    def __init__(self, root: Path, env: dict):
+        self.root = Path(root)
+        self.bare = self.root / "hub.git"
+        self.work = self.root / "hub_work"  # the "server side" checkout used to make commits
+        self.env = env
+
+    def create(self, files: dict) -> "BareHub":
+        git(self.root, "init", "-q", "--bare", str(self.bare), env=self.env)
+        git(self.bare, "symbolic-ref", "HEAD", "refs/heads/main", env=self.env)
+        make_repo(self.work, self.env, files)
+        git(self.work, "branch", "-q", "-M", "main", env=self.env)
+        git(self.work, "remote", "add", "origin", HUB_URL, env=self.env)
+        git(self.work, "push", "-q", "origin", "main", env=self.env)
+        return self
+
+    def head(self) -> str:
+        return git(self.bare, "rev-parse", "main", env=self.env)
+
+    def commits(self) -> list[str]:
+        """Commit ids on main, newest first (what HfApi.list_repo_commits returns)."""
+        return git(self.bare, "rev-list", "main", env=self.env).split()
+
+    def clone(self, dest: Path) -> None:
+        git(dest.parent, "clone", "-q", HUB_URL, str(dest), env=self.env)
+
+    def commit_folder(self, folder: Path, message: str, ignore_patterns=()) -> str:
+        import fnmatch
+        import shutil
+
+        git(self.work, "pull", "-q", "--ff-only", "origin", "main", env=self.env)
+        for src in Path(folder).rglob("*"):
+            rel = src.relative_to(folder)
+            if ".git" in rel.parts or any(
+                fnmatch.fnmatch(part, pat) for part in rel.parts for pat in ignore_patterns
+            ):
+                continue
+            if src.is_file():
+                (self.work / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, self.work / rel)
+        git(self.work, "add", "-A", env=self.env)
+        if git(self.work, "status", "--porcelain", env=self.env):
+            git(self.work, "commit", "-q", "-m", message, env=self.env)
+            git(self.work, "push", "-q", "origin", "HEAD:main", env=self.env)
+        return self.head()
+
+    def push_change(self, name: str, content: str) -> str:
+        """Someone else changes the Hub repo (e.g. a web edit)."""
+        git(self.work, "pull", "-q", "--ff-only", "origin", "main", env=self.env)
+        (self.work / name).write_text(content, encoding="utf-8")
+        git(self.work, "add", name, env=self.env)
+        git(self.work, "commit", "-q", "-m", f"edit {name}", env=self.env)
+        git(self.work, "push", "-q", "origin", "HEAD:main", env=self.env)
+        return self.head()
+
+
 def fake_sha(n: int) -> str:
     """A well-formed commit id that no local repo contains."""
     return f"{n:040x}"
@@ -103,6 +167,21 @@ class FakeHub:
         self.repo_missing = repo_missing
         self.saved_token = saved_token
         self.uploads: list[dict] = []
+        # When set, uploads commit to this BareHub and commits are read from it.
+        self.bare_hub: BareHub | None = None
+        self.after_upload = None  # optional callable, run after each upload
+
+    def _upload(self, **kwargs):
+        self.uploads.append(kwargs)
+        result = None
+        if self.bare_hub is not None:
+            oid = self.bare_hub.commit_folder(
+                Path(kwargs["folder_path"]), kwargs["commit_message"], kwargs.get("ignore_patterns", ())
+            )
+            result = types.SimpleNamespace(oid=oid)  # like huggingface_hub's CommitInfo
+        if self.after_upload:
+            self.after_upload()
+        return result
 
     def modules(self, with_xet: bool = True) -> dict:
         """sys.modules entries; use with mock.patch.dict(sys.modules, ...)."""
@@ -127,12 +206,13 @@ class FakeHub:
             def list_repo_commits(self, repo_id, token=None):
                 if state.commits_error:
                     raise state.commits_error
-                return [Commit(c) for c in state.commits]
+                commits = state.bare_hub.commits() if state.bare_hub else state.commits
+                return [Commit(c) for c in commits]
 
         hub.__version__ = "1.30.0"
         hub.HfApi = HfApi
         hub.get_token = lambda: state.saved_token
-        hub.upload_folder = lambda **kwargs: state.uploads.append(kwargs)
+        hub.upload_folder = state._upload
         hub.utils = utils
         utils.RepositoryNotFoundError = RepositoryNotFoundError
 
@@ -162,8 +242,24 @@ def _log(event, **data):
 def get_token():
     return _state().get("saved_token")
 
+def _bare_hub():
+    root = _state().get("bare_hub_root")
+    if not root:
+        return None
+    from pathlib import Path
+    from tests.support import BareHub  # the script's folder is on sys.path
+    return BareHub(Path(root), dict(os.environ))
+
 def upload_folder(**kwargs):
     _log("upload_folder", **kwargs)
+    hub = _bare_hub()
+    if hub is None:
+        return None
+    from pathlib import Path
+    from types import SimpleNamespace
+    oid = hub.commit_folder(Path(kwargs["folder_path"]), kwargs["commit_message"],
+                            kwargs.get("ignore_patterns", ()))
+    return SimpleNamespace(oid=oid)
 
 class _Commit:
     def __init__(self, commit_id):
@@ -180,7 +276,9 @@ class HfApi:
         state = _state()
         if state.get("commits_error"):
             raise ConnectionError(state["commits_error"])
-        return [_Commit(c) for c in state.get("commits", [])]
+        hub = _bare_hub()
+        commits = hub.commits() if hub else state.get("commits", [])
+        return [_Commit(c) for c in commits]
 '''
 
 
@@ -213,7 +311,9 @@ class FakeHubProcess:
     def env(self, base_env: dict) -> dict:
         env = dict(base_env)
         env.update(
-            PYTHONPATH=str(self.site), FAKE_HF_STATE=str(self.state_file), FAKE_HF_LOG=str(self.log_file)
+            PYTHONPATH=os.pathsep.join([str(self.site), str(SCRIPT_DIR)]),
+            FAKE_HF_STATE=str(self.state_file),
+            FAKE_HF_LOG=str(self.log_file),
         )
         return env
 

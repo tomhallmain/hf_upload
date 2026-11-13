@@ -46,11 +46,23 @@ class HFUploadManager:
         self.tracked_large_files = []
         self.untracked_large_files = []
         self.delete_missing = False
+        self.sync_git = True
 
-    def _run_git_command(self, cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-        """Run a git command in the repository context"""
+    def _run_git_command(self, cmd: List[str], check: bool = True,
+                         no_prompt: bool = False) -> subprocess.CompletedProcess:
+        """Run a git command in the repository context.
+
+        no_prompt: fail instead of asking for credentials on the terminal (git would otherwise
+        wait for input that captured output hides).
+        """
         full_cmd = ["git", "-C", str(self.repo_path)] + cmd
-        return subprocess.run(full_cmd, check=check, capture_output=True, text=True)
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"} if no_prompt else None
+        return subprocess.run(full_cmd, check=check, capture_output=True, text=True, env=env)
+
+    def _git_output(self, *args: str) -> Optional[str]:
+        """stdout of a git command, or None if it fails."""
+        result = self._run_git_command(list(args), check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
 
     @property
     def remote_url(self) -> str:
@@ -64,7 +76,8 @@ class HFUploadManager:
         for git auth use `hf auth login` and accept storing it as a git credential.
         Leaves a remote that points somewhere else untouched and returns False.
         """
-        result = self._run_git_command(["remote", "get-url", name], check=False)
+        # The configured URL, not `git remote get-url`, which applies url.*.insteadOf rewrites.
+        result = self._run_git_command(["config", "--get", f"remote.{name}.url"], check=False)
         if result.returncode != 0:
             try:
                 self._run_git_command(["remote", "add", name, self.remote_url])
@@ -540,19 +553,102 @@ class HFUploadManager:
             # unless delete_patterns is set (see --delete-missing).
             if self.delete_missing:
                 upload_kwargs["delete_patterns"] = ["*"]
-            upload_folder(**upload_kwargs)
 
-            print("✅ Successfully uploaded to Hugging Face!")
-            # The API upload does not use git. Record the remote anyway so `git remote -v`,
-            # `git fetch` etc. know where the repo lives.
-            if (self.repo_path / ".git").is_dir():
-                self.ensure_remote()
-            print(f"📍 Your model is available at: https://huggingface.co/{self.repo_id}")
-            return True
-            
+            has_git = (self.repo_path / ".git").is_dir()
+            sync = has_git and self.sync_git
+            if sync:  # recorded before uploading, to know whether local was up to date
+                hub_commits = self.get_hub_commits()
+                hub_head_before = hub_commits[0] if hub_commits else None
+                local_head_before = self._git_output("rev-parse", "--verify", "-q", "HEAD")
+
+            commit_info = upload_folder(**upload_kwargs)
         except Exception as e:
             print(f"❌ Upload failed: {e}")
-        return False
+            return False
+
+        print("✅ Successfully uploaded to Hugging Face!")
+        # The API upload does not use git. Record the remote anyway so `git remote -v`,
+        # `git fetch` etc. know where the repo lives.
+        if has_git:
+            remote_ok = self.ensure_remote()
+            if sync:
+                if not remote_ok:
+                    print("ℹ️  Not syncing local git: origin is not the Hub repo.")
+                else:
+                    try:
+                        self.sync_local_git(hub_head_before, local_head_before,
+                                            getattr(commit_info, "oid", None))
+                    except Exception as e:  # never turn a successful upload into a failure
+                        print(f"⚠️  Could not sync local git: {e}")
+                        self._print_manual_sync()
+        print(f"📍 Your model is available at: https://huggingface.co/{self.repo_id}")
+        return True
+
+    @staticmethod
+    def _print_manual_sync():
+        print("   To move your local branch to the Hub's latest commit (files are not changed):")
+        print("     git fetch origin")
+        print("     git reset origin/main")
+
+    def sync_local_git(self, hub_head_before: Optional[str], local_head_before: Optional[str],
+                       new_commit: Optional[str]) -> bool:
+        """After an API upload, point local HEAD and index at the commit the upload created.
+
+        The working tree is what was just uploaded, so after `git reset --mixed` git status
+        shows it as committed. Runs only when local HEAD was the Hub's latest commit before
+        the upload; local-only commits are never moved away from. The working tree is never
+        modified.
+        """
+        print("\n🔄 Syncing local git with the new Hub commit...")
+        if not new_commit:
+            print("ℹ️  The upload did not report its commit id; local git not synced.")
+            self._print_manual_sync()
+            return False
+        if new_commit == local_head_before:
+            print("✓ Nothing changed on the Hub; local git already matches it.")
+            return True
+        if not hub_head_before or local_head_before != hub_head_before:
+            print("ℹ️  Local git not synced: before the upload, local HEAD was not the Hub's")
+            print("   latest commit (local-only commits, or history not compared).")
+            print("   Commit or push those changes yourself, or, to drop them from your branch:")
+            self._print_manual_sync()
+            return False
+
+        fetch = self._run_git_command(
+            ["fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+            check=False, no_prompt=True,
+        )
+        if fetch.returncode != 0:
+            print(f"⚠️  git fetch failed: {fetch.stderr.strip()}")
+            print("   (A private repo needs git credentials: `hf auth login`, and store the")
+            print("    token as a git credential.)")
+            self._print_manual_sync()
+            return False
+
+        hub_main = self._git_output("rev-parse", "--verify", "-q", "refs/remotes/origin/main")
+        if hub_main != new_commit:
+            print(f"ℹ️  Hub main is now {str(hub_main)[:8]}, not the uploaded commit "
+                  f"{new_commit[:8]} (another change landed); local git not synced.")
+            print("   Review with `git log HEAD..origin/main`, then pull.")
+            return False
+        is_child = self._run_git_command(
+            ["merge-base", "--is-ancestor", local_head_before, new_commit], check=False
+        )
+        if is_child.returncode != 0:
+            print("ℹ️  The uploaded commit does not follow local HEAD; local git not synced.")
+            return False
+
+        self._run_git_command(["reset", "--quiet", "--mixed", new_commit])
+        print(f"✓ Local git now at {new_commit[:8]}, the commit this upload created.")
+        status = self._git_output("status", "--short") or ""
+        if status:
+            lines = status.splitlines()
+            print("   Remaining local differences (files the upload skipped or left on the Hub):")
+            for line in lines[:10]:
+                print(f"     {line}")
+            if len(lines) > 10:
+                print(f"     ... and {len(lines) - 10} more (git status)")
+        return True
 
 
 def find_git_repo(start_path: Path) -> Optional[Path]:
@@ -626,6 +722,11 @@ def main():
         help="hub method: also delete files from the Hub repo that no longer exist locally"
     )
     parser.add_argument(
+        "--no-sync-git",
+        action="store_true",
+        help="hub method: don't move local git to the new Hub commit after uploading"
+    )
+    parser.add_argument(
         "--ignore-local-git",
         action="store_true",
         help="Upload even if the folder's .git does not match the Hub repo's history"
@@ -697,6 +798,7 @@ def main():
         print(f"❌ {e}")
         sys.exit(1)
     manager.delete_missing = args.delete_missing
+    manager.sync_git = not args.no_sync_git
 
     if args.set_remote_only:
         sys.exit(0 if manager.ensure_remote() else 1)
